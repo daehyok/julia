@@ -248,11 +248,9 @@ static void NOINLINE JL_NORETURN JL_USED_FUNC start_task(void)
     jl_value_t *res;
     t->started = 1;
     if (t->exception != jl_nothing) {
-        assert(!ptls->exception_in_transit);
         size_t bt_size = rec_backtrace(ptls->bt_data, JL_MAX_BT_SIZE);
-        t->exc_stack = jl_init_exc_stack(bt_size);
-        // FIXME!!!  exc_stack GC memory management. What to do?
-        jl_push_exc_stack(t->exc_stack, t->exception, ptls->bt_data, bt_size);
+        jl_reserve_exc_stack(&t->exc_stack, bt_size+2);
+        jl_push_exc_stack(&t->exc_stack, t->exception, ptls->bt_data, bt_size);
         res = t->exception;
     }
     else {
@@ -266,6 +264,8 @@ static void NOINLINE JL_NORETURN JL_USED_FUNC start_task(void)
             res = jl_apply(&t->start, 1);
         }
         JL_CATCH {
+            // FIXME: Persist exception stack into `exception`?
+            // Refactor with jl_push_exc_stack above?
             res = jl_current_exception();
             t->exception = res;
             jl_gc_wb(t, res);
@@ -311,25 +311,35 @@ static void ctx_switch(jl_ptls_t ptls, jl_task_t **pt)
 #endif
     if (!jl_setjmp(ptls->current_task->ctx, 0)) {
         jl_task_t *lastt = ptls->current_task;
+
+        // Swap exception stacks. Note that the state must be left consistent
+        // if allocations throw, so we reserve space before doing anything else.
+        if (ptls->exc_stack->top) {
+            // May throw
+            jl_reserve_exc_stack(&lastt->exc_stack, ptls->exc_stack->top);
+        }
+        if (t->exc_stack && t->exc_stack->top) {
+            // Only necessary if t->exc_stack was run on a different thread.
+            jl_reserve_exc_stack(&ptls->exc_stack, t->exc_stack->top);
+        }
+
 #ifdef COPY_STACKS
         save_stack(ptls, lastt, pt); // allocates (gc-safepoint, and can also fail)
 #else
         *pt = lastt; // can't fail after here: clear the gc-root for the target task now
 #endif
+        // Cannot throw.
+        if (ptls->exc_stack->top) {
+            jl_copy_exc_stack(lastt->exc_stack, ptls->exc_stack);
+        }
+        if (t->exc_stack && t->exc_stack->top) {
+            jl_copy_exc_stack(ptls->exc_stack, t->exc_stack);
+            t->exc_stack->top = 0;
+        }
 
         // set up global state for new task
         lastt->gcstack = ptls->pgcstack;
         lastt->world_age = ptls->world_age;
-        if (ptls->exc_stack->top != 0) {
-            lastt->exc_stack = ptls->exc_stack;
-            if (t->exc_stack) {
-                ptls->exc_stack = t->exc_stack;
-                t->exc_stack = NULL;
-            }
-            else {
-                ptls->exc_stack = jl_init_exc_stack(JL_MAX_BT_SIZE);
-            }
-        }
         ptls->pgcstack = t->gcstack;
         ptls->world_age = t->world_age;
 #ifdef JULIA_ENABLE_THREADING
@@ -548,16 +558,19 @@ JL_DLLEXPORT JL_NORETURN void jl_no_exc_handler(jl_value_t *e)
 }
 
 // yield to exception handler
-void JL_NORETURN throw_internal(jl_value_t *e)
+void JL_NORETURN throw_internal(jl_value_t *exception,
+                                uintptr_t* bt_data, size_t bt_size)
 {
     jl_ptls_t ptls = jl_get_ptls_states();
     ptls->io_wait = 0;
     if (ptls->safe_restore)
         jl_longjmp(*ptls->safe_restore, 1);
     jl_gc_unsafe_enter(ptls);
-    if (e)
-        ptls->exception_in_transit = e;
-    assert(ptls->exception_in_transit != NULL || ptls->exc_stack->top != 0);
+    if (exception) {
+        // Persist exception in transit before a new one can be generated.
+        jl_push_exc_stack(&ptls->exc_stack, exception, bt_data, bt_size);
+    }
+    assert(ptls->exc_stack->top);
     jl_handler_t *eh = ptls->current_task->eh;
     if (eh != NULL) {
 #ifdef ENABLE_TIMINGS
@@ -570,7 +583,7 @@ void JL_NORETURN throw_internal(jl_value_t *e)
         jl_longjmp(eh->eh_ctx, 1);
     }
     else {
-        jl_no_exc_handler(e);
+        jl_no_exc_handler(exception);
     }
     assert(0);
 }
@@ -580,16 +593,24 @@ JL_DLLEXPORT void jl_throw(jl_value_t *e)
 {
     jl_ptls_t ptls = jl_get_ptls_states();
     assert(e != NULL);
-    if (!ptls->safe_restore)
-        ptls->bt_size = rec_backtrace(ptls->bt_data, JL_MAX_BT_SIZE);
-    throw_internal(e);
+    if (ptls->safe_restore)
+        throw_internal(NULL, NULL, 0);
+    size_t bt_size = rec_backtrace(ptls->bt_data, JL_MAX_BT_SIZE);
+    throw_internal(e, ptls->bt_data, bt_size);
 }
 
+// rethrow with current exc_stack state
 JL_DLLEXPORT void jl_rethrow(void)
 {
-    // rethrow with current exc_stack state (or ptls->exception_in_transit
-    // for the special case of jl_throw_in_ctx)
-    throw_internal(NULL);
+    throw_internal(NULL, NULL, 0);
+}
+
+JL_DLLEXPORT void jl_sig_throw(void)
+{
+    jl_ptls_t ptls = jl_get_ptls_states();
+    jl_value_t *e = ptls->sig_exception;
+    assert(e);
+    throw_internal(e, ptls->bt_data, ptls->bt_size);
 }
 
 JL_DLLEXPORT void jl_rethrow_other(jl_value_t *e)
@@ -600,7 +621,7 @@ JL_DLLEXPORT void jl_rethrow_other(jl_value_t *e)
     assert(ptls->exc_stack->top != 0);
     // overwrite exception on top of stack. see jl_exc_stack_exception
     jl_excstk_raw(ptls->exc_stack)[ptls->exc_stack->top-1] = (uintptr_t)e;
-    throw_internal(NULL);
+    jl_rethrow();
 }
 
 JL_DLLEXPORT jl_task_t *jl_new_task(jl_function_t *start, size_t ssize)
